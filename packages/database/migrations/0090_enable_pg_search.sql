@@ -1,2 +1,3 @@
--- Custom SQL migration file, put your code below! --
-CREATE EXTENSION IF NOT EXISTS pg_search;
+-- Neon compatibility patch for this fork.
+-- This deployment uses FTS_SEARCH_PROVIDER=pg_like because Neon no longer allows pg_search.
+-- Keep this migration as an intentional no-op so Drizzle records it and later migrations can continue.
