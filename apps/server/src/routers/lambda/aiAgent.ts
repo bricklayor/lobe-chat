@@ -16,13 +16,13 @@ import type {
 import {
   CreateThreadWithMessageSchema,
   entityIdPattern,
+  initialTopicMetadataSchema,
   isServerDefaultHeterogeneousRelayInvocation,
   LocalHeterogeneousAgentTypeSchema,
   RequestTrigger,
   ThreadStatus,
   ThreadType,
   UserInterventionConfigSchema,
-  workingDirConfigSchema,
 } from '@lobechat/types';
 import { TRPCError } from '@trpc/server';
 import debug from 'debug';
@@ -1030,6 +1030,13 @@ const StartExecutionSchema = z.object({
 const acceptsMemberRuntimeEndOf = (streamFeatures: string[] | undefined): boolean =>
   streamFeatures?.includes('member_runtime_end') ?? false;
 
+/** A client's declaration that it can run relayed LLM attempts (`agent_llm_relay`). */
+const LlmExecutorSchema = z.object({
+  capabilities: z.array(z.string()).max(16),
+  clientId: z.string().min(1).max(128),
+  providers: z.array(z.string()).max(256),
+});
+
 const ExecAgentSchema = z
   .object({
     includeFinalState: z.boolean().optional(),
@@ -1047,6 +1054,12 @@ const ExecAgentSchema = z
      * server-initiated run), which keeps the pushed snapshots.
      */
     clientProtocol: z.union([z.literal(1), z.literal(2)]).optional(),
+    /**
+     * The calling client can execute single LLM attempts the server relays to
+     * it (`llm_execute`) for providers only this device can reach. Sent only
+     * when the client is inside the `agent_llm_relay` rollout.
+     */
+    llmExecutor: LlmExecutorSchema.optional(),
     /** The agent ID to run (either agentId or slug is required) */
     agentId: z.string().optional(),
     /** Application context for message storage */
@@ -1060,13 +1073,10 @@ const ExecAgentSchema = z
         /** The group being edited when scope is 'group_agent_builder' (not a group chat turn). */
         editingGroupId: z.string().optional(),
         groupId: z.string().nullish(),
-        initialTopicMetadata: z
-          .object({
-            repos: z.array(z.string()).optional(),
-            workingDirectory: z.string().optional(),
-            workingDirectoryConfig: workingDirConfigSchema.optional(),
-          })
-          .optional(),
+        // The shared declaration, not a copy of it: a local `z.object()` here
+        // silently strips whatever the type gained and the call still answers
+        // 200, so the two must be one thing.
+        initialTopicMetadata: initialTopicMetadataSchema.optional(),
         /**
          * Branch this run into a new thread (subtopic) under the resolved topic.
          * The gateway path never calls `aiChat.sendMessageInServer`, so this is
@@ -1514,6 +1524,8 @@ const AgentStreamEventSchema = z.object({
     'tool_start',
     'tool_end',
     'tool_execute',
+    'llm_execute',
+    'llm_cancel',
     'tool_result',
     'agent_intervention_request',
     'agent_intervention_response',
@@ -2459,6 +2471,7 @@ export const aiAgentRouter = router({
         },
         clientProtocol: input.clientProtocol,
         includeFinalState: input.includeFinalState,
+        llmExecutor: input.llmExecutor,
         // This procedure serves the composer (`aiAgentService.execAgentTask`).
         // The client already queues follow-ups behind a live run and shows the
         // user a tray; refusing here would only make the message disappear.
@@ -2618,6 +2631,7 @@ export const aiAgentRouter = router({
           acceptsMemberRuntimeEnd: acceptsMemberRuntimeEndOf(task.streamFeatures),
           clientProtocol: task.clientProtocol,
           includeFinalState: task.includeFinalState,
+          llmExecutor: task.llmExecutor,
           agentId,
           appContext,
           autoStart,
@@ -3202,6 +3216,28 @@ export const aiAgentRouter = router({
         toolMessageIds: input.toolMessageIds,
         topicId: input.topicId,
       });
+    }),
+
+  /**
+   * Runs of the caller parked in `waiting_for_client`: their next LLM call needs
+   * the user's device and no client took it. A client that can run the provider
+   * continues them with `resumeClientLlmWait`.
+   */
+  listClientLlmWaits: aiAgentProcedure
+    .input(z.object({ providers: z.array(z.string().min(1)).max(256).optional() }).optional())
+    .query(async ({ input, ctx }) => {
+      return ctx.aiAgentService.listClientLlmWaits(input?.providers);
+    }),
+
+  /**
+   * Continue a run parked in `waiting_for_client` from the step it parked on,
+   * with the calling client as the run's relay executor. `resumed: false` when
+   * the run is no longer parked (already resumed, expired or stopped).
+   */
+  resumeClientLlmWait: aiAgentWriteProcedure
+    .input(z.object({ llmExecutor: LlmExecutorSchema, operationId: z.string().min(1) }))
+    .mutation(async ({ input, ctx }) => {
+      return ctx.aiAgentService.resumeFromClientLlmWait(input);
     }),
 
   interruptTask: aiAgentWriteProcedure
